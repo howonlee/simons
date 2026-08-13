@@ -1,10 +1,10 @@
-"""Pedagogical tests for the classical tensor-train Simon implementation.
+"""Pedagogical tests for the classical structured-tensor Simon implementation.
 
 These examples make an important scope distinction explicit: Simon's problem
 is exponentially hard for a *black-box* classical algorithm, while ``simon``
-is given a white-box tensor train and can be efficient when its bond dimensions
-stay small.  The final test demonstrates that favorable structured case without
-ever materializing an exponentially large truth table.
+is given a structured white-box representation.  It can be efficient when TT
+bond dimensions stay small or when a circuit factor graph has small induced
+width.  The tests exercise both routes without hiding their exponential cases.
 """
 
 import random
@@ -13,7 +13,9 @@ import unittest
 import numpy as np
 
 from simon import (
+    SimonFactorOracle,
     SimonOracleTT,
+    boolean_function_factor,
     gf2_nullspace,
     make_simon_truth_table,
     recover_period_direct,
@@ -45,6 +47,28 @@ def _rank_one_bit_deletion_oracle(num_bits: int, hidden_bit: int) -> SimonOracle
             core[0, 1, 1, 0] = 1.0
         cores.append(core)
     return SimonOracleTT(tuple(cores))
+
+
+def _factored_dense_kernel_oracle(num_bits: int) -> SimonFactorOracle:
+    """Return a local circuit for a map whose kernel is the all-ones vector.
+
+    The relation has internal gate wires and a star-like dependency on the last
+    input.  It is supplied as a circuit factor graph, not converted to a TT.
+    """
+    inputs = tuple(("x", bit) for bit in range(num_bits))
+    outputs = tuple(("y", bit) for bit in range(num_bits - 1))
+    factors = []
+    for bit, output in enumerate(outputs):
+        wire = ("wire", bit)
+        factors.append(
+            boolean_function_factor(
+                (inputs[bit], inputs[-1]), wire, lambda a, b: a ^ b
+            )
+        )
+        # A separate buffer gate makes the summed internal-wire semantics part
+        # of the test rather than merely using overlapping direct constraints.
+        factors.append(boolean_function_factor((wire,), output, lambda a: a))
+    return SimonFactorOracle(tuple(factors), inputs, outputs)
 
 
 class SimonPedagogicalTests(unittest.TestCase):
@@ -120,6 +144,24 @@ class SimonPedagogicalTests(unittest.TestCase):
         )
         self.assertEqual(
             recover_period_fourier(oracle, rng=random.Random(9)), period
+        )
+
+    def test_factor_network_oracle_handles_a_local_circuit(self) -> None:
+        """A circuit network can be contracted without making an oracle TT."""
+        num_bits = 6
+        period = (1 << num_bits) - 1
+        oracle = _factored_dense_kernel_oracle(num_bits)
+
+        collisions = oracle.collision_network().to_dense()
+        expected = np.zeros(1 << num_bits)
+        expected[0] = expected[period] = 1 << num_bits
+        np.testing.assert_allclose(collisions, expected)
+
+        self.assertEqual(
+            recover_period_direct(oracle, rng=random.Random(10)), period
+        )
+        self.assertEqual(
+            recover_period_fourier(oracle, rng=random.Random(11)), period
         )
 
 

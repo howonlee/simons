@@ -1,11 +1,11 @@
-"""A classical, tensor-train implementation of Simon's algorithm.
+"""Classical structured-tensor implementations of Simon's algorithm.
 
 The usual black-box problem supplies a function ``f`` with the promise
 
     f(x) == f(y)  iff  y == x or y == x ^ s.
 
-This module instead takes a *white-box tensor train* for the complete relation
-``F(x, y) = 1[y == f(x)]``.  Each oracle core has shape
+The first representation takes a *white-box tensor train* for the complete
+relation ``F(x, y) = 1[y == f(x)]``.  Each oracle core has shape
 ``(left_bond, 2, output_alphabet, right_bond)`` and represents one input bit and
 one local output digit.  Contracting two copies of the train constructs
 
@@ -16,9 +16,14 @@ nonzero only at ``0`` and ``s``.  We can therefore recover ``s`` directly by
 sampling C, or imitate Simon's quantum algorithm classically: Walsh-transform
 C, sample vectors orthogonal to s, and solve a linear system over GF(2).
 
-The running time is polynomial in the number of sites and in the *intermediate
-TT bond dimensions*.  It is not a polynomial-time algorithm for arbitrary
-white-box programs: their exact tensor-train ranks can be exponential.
+The second representation takes local factors for a Boolean circuit or
+constraint network.  It forms the doubled collision network directly and uses
+variable elimination, without first compressing the whole oracle relation into
+a one-dimensional train.  This replaces the TT's pathwidth restriction by an
+induced-width/treewidth restriction and can handle very different structures.
+
+Neither route is a polynomial-time algorithm for arbitrary white-box programs:
+exact TT ranks and variable-elimination intermediates can both be exponential.
 
 Bit/site order is little-endian throughout: core k corresponds to integer bit k.
 """
@@ -28,7 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import random
-from typing import Iterable, Sequence
+from typing import Callable, Hashable, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -187,6 +192,214 @@ class BinaryTT:
 
 
 @dataclass(frozen=True)
+class BinaryFactor:
+    """A dense local factor over named binary variables.
+
+    Unlike a TT core, a factor may connect any small set of variables.  A
+    collection of these factors is useful for describing a Boolean circuit or
+    constraint system without first forcing it through a one-dimensional cut.
+    """
+
+    variables: tuple[Hashable, ...]
+    values: Array
+
+    def __post_init__(self) -> None:
+        variables = tuple(self.variables)
+        if len(set(variables)) != len(variables):
+            raise ValueError("a factor cannot contain a variable twice")
+        values = np.asarray(self.values)
+        if values.shape != (2,) * len(variables):
+            raise ValueError(
+                f"factor shape {values.shape} does not match "
+                f"{len(variables)} binary variables"
+            )
+        object.__setattr__(self, "variables", variables)
+        object.__setattr__(self, "values", values)
+
+    def renamed(self, names: Mapping[Hashable, Hashable]) -> "BinaryFactor":
+        """Return this factor with variables renamed according to ``names``."""
+        return BinaryFactor(tuple(names.get(v, v) for v in self.variables), self.values)
+
+    def restricted(self, evidence: Mapping[Hashable, int]) -> "BinaryFactor":
+        """Fix variables present in ``evidence`` and remove their axes."""
+        index = tuple(evidence.get(v, slice(None)) for v in self.variables)
+        remaining = tuple(v for v in self.variables if v not in evidence)
+        return BinaryFactor(remaining, self.values[index])
+
+    def multiply(self, other: "BinaryFactor") -> "BinaryFactor":
+        """Multiply factors, aligning axes that name the same variable."""
+        variables = self.variables + tuple(
+            v for v in other.variables if v not in self.variables
+        )
+
+        def aligned(factor: "BinaryFactor") -> Array:
+            ordered = tuple(v for v in variables if v in factor.variables)
+            permutation = tuple(factor.variables.index(v) for v in ordered)
+            values = factor.values
+            if permutation != tuple(range(len(permutation))):
+                values = np.transpose(values, permutation)
+            shape = tuple(2 if v in factor.variables else 1 for v in variables)
+            return values.reshape(shape)
+
+        return BinaryFactor(variables, aligned(self) * aligned(other))
+
+    def sum_out(self, variable: Hashable) -> "BinaryFactor":
+        """Sum one variable out of this factor."""
+        if variable not in self.variables:
+            return self
+        axis = self.variables.index(variable)
+        variables = self.variables[:axis] + self.variables[axis + 1 :]
+        return BinaryFactor(variables, self.values.sum(axis=axis))
+
+
+def boolean_function_factor(
+    inputs: Sequence[Hashable],
+    output: Hashable,
+    function: Callable[..., int],
+    *,
+    dtype=float,
+) -> BinaryFactor:
+    """Create the relation factor ``output == function(*inputs)``.
+
+    This convenience constructor makes AND, XOR, NOT, S-box-bit, and other
+    small Boolean circuit constraints easy to express.  Large truth tables are
+    deliberately not hidden: the factor has ``2**(len(inputs) + 1)`` entries.
+    """
+    inputs = tuple(inputs)
+    if output in inputs or len(set(inputs)) != len(inputs):
+        raise ValueError("gate input and output variables must be distinct")
+    table = np.zeros((2,) * (len(inputs) + 1), dtype=dtype)
+    for index in np.ndindex((2,) * len(inputs)):
+        value = int(function(*index))
+        if value not in (0, 1):
+            raise ValueError("a Boolean gate must return zero or one")
+        table[index + (value,)] = 1
+    return BinaryFactor(inputs + (output,), table)
+
+
+@dataclass(frozen=True)
+class BinaryFactorNetwork:
+    """An open binary tensor network contracted by exact variable elimination.
+
+    Complexity is exponential in induced width (treewidth for a good order),
+    rather than in the pathwidth imposed by a tensor train.  This makes the
+    representation complementary to :class:`BinaryTT`: either may be much
+    smaller than the other on a particular structured problem.
+    """
+
+    factors: tuple[BinaryFactor, ...]
+    open_variables: tuple[Hashable, ...]
+
+    def __post_init__(self) -> None:
+        factors = tuple(self.factors)
+        open_variables = tuple(self.open_variables)
+        if len(set(open_variables)) != len(open_variables):
+            raise ValueError("open variables must be distinct")
+        object.__setattr__(self, "factors", factors)
+        object.__setattr__(self, "open_variables", open_variables)
+
+    @property
+    def num_bits(self) -> int:
+        return len(self.open_variables)
+
+    def _contract(self, evidence: Mapping[Hashable, int]):
+        unknown = set(evidence) - set(self.open_variables)
+        if unknown:
+            raise ValueError(f"evidence contains non-open variables: {unknown!r}")
+        if any(bit not in (0, 1) for bit in evidence.values()):
+            raise ValueError("binary evidence values must be zero or one")
+
+        factors = [factor.restricted(evidence) for factor in self.factors]
+        variables: list[Hashable] = []
+        for factor in factors:
+            for variable in factor.variables:
+                if variable not in variables:
+                    variables.append(variable)
+
+        # Greedy min-scope elimination.  It is inexpensive and avoids imposing
+        # the bit order as a path decomposition, though it is not always the
+        # globally optimal treewidth order.
+        while variables:
+            def elimination_width(variable: Hashable) -> int:
+                scope: set[Hashable] = set()
+                for factor in factors:
+                    if variable in factor.variables:
+                        scope.update(factor.variables)
+                return len(scope)
+
+            variable = min(variables, key=elimination_width)
+            variables.remove(variable)
+            bucket = [factor for factor in factors if variable in factor.variables]
+            if not bucket:
+                continue
+            factors = [factor for factor in factors if variable not in factor.variables]
+            product = bucket[0]
+            for factor in bucket[1:]:
+                product = product.multiply(factor)
+            factors.append(product.sum_out(variable))
+
+        if not factors:
+            return 1.0
+        product = factors[0]
+        for factor in factors[1:]:
+            product = product.multiply(factor)
+        if product.variables:
+            raise RuntimeError("internal error: variable elimination was incomplete")
+        return product.values.item()
+
+    def evaluate(self, index: int):
+        """Evaluate one entry without materializing the open tensor."""
+        if not 0 <= index < (1 << self.num_bits):
+            raise IndexError(f"index {index} is outside [0, {1 << self.num_bits})")
+        evidence = {v: (index >> k) & 1 for k, v in enumerate(self.open_variables)}
+        return self._contract(evidence)
+
+    def to_dense(self) -> Array:
+        """Materialize the open tensor; intended for tests and small networks."""
+        return np.asarray([self.evaluate(x) for x in range(1 << self.num_bits)])
+
+    def sample(
+        self,
+        rng: random.Random | None = None,
+        *,
+        atol: float = 1e-10,
+    ) -> int:
+        """Sample nonnegative entries using conditional network contractions."""
+        if rng is None:
+            rng = random
+        evidence: dict[Hashable, int] = {}
+        index = 0
+        for k, variable in enumerate(self.open_variables):
+            evidence[variable] = 0
+            w0 = _as_real_nonnegative(
+                self._contract(evidence), atol=atol, what=f"bit {k} weight 0"
+            )
+            evidence[variable] = 1
+            w1 = _as_real_nonnegative(
+                self._contract(evidence), atol=atol, what=f"bit {k} weight 1"
+            )
+            total = w0 + w1
+            if total <= atol:
+                raise ValueError(f"zero conditional mass at bit {k}")
+            bit = int(rng.random() * total >= w0)
+            evidence[variable] = bit
+            index |= bit << k
+        return index
+
+    def walsh_hadamard(self, *, normalized: bool = False) -> "BinaryFactorNetwork":
+        """Attach local Walsh factors and expose their other legs as outputs."""
+        factor = 1 / math.sqrt(2) if normalized else 1
+        hadamard = factor * np.asarray([[1, 1], [1, -1]], dtype=float)
+        transformed = list(self.factors)
+        outputs = []
+        for k, variable in enumerate(self.open_variables):
+            output = ("walsh-output", id(self), k)
+            transformed.append(BinaryFactor((variable, output), hadamard))
+            outputs.append(output)
+        return BinaryFactorNetwork(tuple(transformed), tuple(outputs))
+
+
+@dataclass(frozen=True)
 class SimonOracleTT:
     """TT for ``F(x, y)``, with an input bit and output digit at every site.
 
@@ -291,6 +504,100 @@ class SimonOracleTT:
         return cls(tuple(oracle_cores))
 
 
+@dataclass(frozen=True)
+class SimonFactorOracle:
+    """A factored relation for Simon's oracle, optionally with internal wires.
+
+    The product of ``factors``, summed over variables that are neither inputs
+    nor outputs, represents ``F(x, y)``.  For ordinary Boolean circuits every
+    internal wire has one satisfying value, so local gate-relation factors give
+    exactly ``1[y == f(x)]``.
+
+    Collision construction duplicates the circuit, shares its output, and adds
+    local constraints ``x_prime == x xor shift``.  It therefore avoids ever
+    constructing a TT for the complete input/output truth table.
+    """
+
+    factors: tuple[BinaryFactor, ...]
+    input_variables: tuple[Hashable, ...]
+    output_variables: tuple[Hashable, ...]
+
+    def __post_init__(self) -> None:
+        factors = tuple(self.factors)
+        inputs = tuple(self.input_variables)
+        outputs = tuple(self.output_variables)
+        if not inputs:
+            raise ValueError("a Simon oracle must contain at least one input bit")
+        if len(set(inputs)) != len(inputs) or len(set(outputs)) != len(outputs):
+            raise ValueError("input and output variables must each be distinct")
+        if set(inputs) & set(outputs):
+            raise ValueError("input and output variables must be disjoint")
+        present = {v for factor in factors for v in factor.variables}
+        missing_outputs = set(outputs) - present
+        if missing_outputs:
+            raise ValueError(
+                f"output variables do not occur in a factor: {missing_outputs!r}"
+            )
+        object.__setattr__(self, "factors", factors)
+        object.__setattr__(self, "input_variables", inputs)
+        object.__setattr__(self, "output_variables", outputs)
+
+    @property
+    def num_bits(self) -> int:
+        return len(self.input_variables)
+
+    def collision_network(self) -> BinaryFactorNetwork:
+        """Build an open factor network for ``sum(x,y) conj(F(x,y)) F(x^t,y)``."""
+        inputs = set(self.input_variables)
+        outputs = set(self.output_variables)
+        all_variables = {v for factor in self.factors for v in factor.variables}
+
+        x = {v: ("collision-input", k) for k, v in enumerate(self.input_variables)}
+        xp = {
+            v: ("collision-shifted-input", k)
+            for k, v in enumerate(self.input_variables)
+        }
+        y = {v: ("collision-output", k) for k, v in enumerate(self.output_variables)}
+        first = {}
+        second = {}
+        for variable in all_variables:
+            if variable in inputs:
+                first[variable] = x[variable]
+                second[variable] = xp[variable]
+            elif variable in outputs:
+                first[variable] = second[variable] = y[variable]
+            else:
+                first[variable] = ("collision-first-internal", variable)
+                second[variable] = ("collision-second-internal", variable)
+
+        factors = [
+            BinaryFactor(factor.renamed(first).variables, np.conj(factor.values))
+            for factor in self.factors
+        ]
+        factors.extend(factor.renamed(second) for factor in self.factors)
+
+        shifts = []
+        xor_relation = np.zeros((2, 2, 2), dtype=float)
+        for left, right, shift in np.ndindex(2, 2, 2):
+            xor_relation[left, right, shift] = float(right == (left ^ shift))
+        for k, variable in enumerate(self.input_variables):
+            shift = ("collision-open-shift", k)
+            shifts.append(shift)
+            factors.append(BinaryFactor((x[variable], xp[variable], shift), xor_relation))
+        return BinaryFactorNetwork(tuple(factors), tuple(shifts))
+
+
+SimonOracle = SimonOracleTT | SimonFactorOracle
+
+
+def _collision_representation(
+    oracle: SimonOracle,
+) -> BinaryTT | BinaryFactorNetwork:
+    if isinstance(oracle, SimonOracleTT):
+        return oracle.collision_tt()
+    return oracle.collision_network()
+
+
 def _tt_svd(tensor: Array, physical_dims: Sequence[int], tolerance: float) -> list[Array]:
     """Decompose a dense tensor into open-boundary TT cores."""
     if tolerance < 0:
@@ -355,7 +662,7 @@ def gf2_nullspace(rows: Iterable[int], width: int) -> list[int]:
 
 
 def recover_period_direct(
-    oracle: SimonOracleTT,
+    oracle: SimonOracle,
     *,
     rng: random.Random | None = None,
     max_samples: int = 64,
@@ -368,7 +675,7 @@ def recover_period_direct(
     """
     if max_samples < 1:
         raise ValueError("max_samples must be positive")
-    collision = oracle.collision_tt()
+    collision = _collision_representation(oracle)
     for _ in range(max_samples):
         candidate = collision.sample(rng, atol=atol)
         if candidate:
@@ -377,7 +684,7 @@ def recover_period_direct(
 
 
 def simon_fourier_samples(
-    oracle: SimonOracleTT,
+    oracle: SimonOracle,
     count: int,
     *,
     rng: random.Random | None = None,
@@ -386,12 +693,12 @@ def simon_fourier_samples(
     """Draw Simon equations z with ``z dot s == 0`` from the collision TT."""
     if count < 0:
         raise ValueError("count must be nonnegative")
-    spectrum = oracle.collision_tt().walsh_hadamard()
+    spectrum = _collision_representation(oracle).walsh_hadamard()
     return [spectrum.sample(rng, atol=atol) for _ in range(count)]
 
 
 def recover_period_fourier(
-    oracle: SimonOracleTT,
+    oracle: SimonOracle,
     *,
     rng: random.Random | None = None,
     max_samples: int | None = None,
@@ -404,7 +711,7 @@ def recover_period_fourier(
     if max_samples < 1:
         raise ValueError("max_samples must be positive")
 
-    spectrum = oracle.collision_tt().walsh_hadamard()
+    spectrum = _collision_representation(oracle).walsh_hadamard()
     equations: list[int] = []
     for _ in range(max_samples):
         equations.append(spectrum.sample(rng, atol=atol))
