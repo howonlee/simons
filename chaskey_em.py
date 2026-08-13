@@ -9,7 +9,7 @@ It is primarily a structural experiment.  The builder knows ``s`` in order to
 construct the complete white-box relation; ordinary black-box access to an
 Even--Mansour encryption oracle does not provide such a factorization.
 
-The command-line profiler symbolically follows a min-degree variable
+The command-line profiler symbolically follows the same min-fill variable
 elimination order.  It stops at a configurable scope size before allocating an
 exponential dense factor.  Exact recovery is available for cases whose profile
 is small enough::
@@ -24,13 +24,12 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import heapq
 import random
 from typing import Callable, Hashable, Iterable, Mapping, Sequence
 
 import numpy as np
 
-from simon import (
+from complicated_simon import (
     BinaryFactor,
     BinaryFactorNetwork,
     SimonFactorOracle,
@@ -279,7 +278,7 @@ def elimination_profile(
     *,
     stop_scope: int = 30,
 ) -> EliminationProfile:
-    """Symbolically profile min-degree elimination without dense contractions.
+    """Symbolically profile min-fill elimination without dense contractions.
 
     ``maximum_scope`` includes the variable being eliminated, matching the
     largest bucket product that dense elimination would form.  Profiling stops
@@ -305,13 +304,18 @@ def elimination_profile(
                 adjacency[right].add(left)
 
     initial_variables = len(adjacency)
-    heap = [(len(neighbors), order[v], v) for v, neighbors in adjacency.items()]
-    heapq.heapify(heap)
     eliminated = 0
-    while heap:
-        degree, _, variable = heapq.heappop(heap)
-        if variable not in adjacency or degree != len(adjacency[variable]):
-            continue
+    while adjacency:
+        def score(variable: Hashable) -> tuple[int, int, int]:
+            neighbors = tuple(adjacency[variable])
+            fill = sum(
+                right not in adjacency[left]
+                for index, left in enumerate(neighbors)
+                for right in neighbors[index + 1 :]
+            )
+            return fill, len(neighbors), order[variable]
+
+        variable = min(adjacency, key=score)
         neighbors = tuple(adjacency[variable])
         scope_size = len(neighbors) + 1
         maximum_scope = max(maximum_scope, scope_size)
@@ -332,10 +336,6 @@ def elimination_profile(
                     adjacency[right].add(left)
         del adjacency[variable]
         eliminated += 1
-        for neighbor in neighbors:
-            heapq.heappush(
-                heap, (len(adjacency[neighbor]), order[neighbor], neighbor)
-            )
 
     return EliminationProfile(
         initial_variables,
@@ -354,7 +354,7 @@ def profile_instance(
     stop_scope: int,
 ) -> tuple[SimonFactorOracle, BinaryFactorNetwork, EliminationProfile]:
     oracle = make_chaskey_em_oracle(word_bits, rounds, period)
-    collision = oracle.collision_network()
+    collision = BinaryFactorNetwork.from_network(oracle.collision_network())
     # The first sampler contraction fixes the low shift bit and sums all other
     # open variables.  That is more representative than profiling an entry.
     evidence = {collision.open_variables[0]: 0}
@@ -377,7 +377,7 @@ def recover_verified_period(
     reliable.  A candidate is cheap to verify with ordinary function queries.
     For at most 16 input bits this routine verifies exhaustively.
     """
-    collision = oracle.collision_network()
+    collision = BinaryFactorNetwork.from_network(oracle.collision_network())
     width = oracle.num_bits
     exhaustive = width <= 16
     for _ in range(max_samples):
