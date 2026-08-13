@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "structured-simon"
+version = "0.1.0"
+description = "Classical structured-tensor experiments for Simon's algorithm"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.scripts]
+simon = "simon:_demo"
+chaskey-em = "chaskey_em:main"
+
+[tool.setuptools]
+py-modules = ["simon", "complicated_simon", "chaskey_em"]
+
+[tool.uv]
+package = true
