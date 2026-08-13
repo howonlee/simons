@@ -20,7 +20,6 @@ The running time is polynomial in the number of sites and in the *intermediate
 TT bond dimensions*.  It is not a polynomial-time algorithm for arbitrary
 white-box programs: their exact tensor-train ranks can be exponential.
 
-Only NumPy is required; nothing is imported from the sibling propbits project.
 Bit/site order is little-endian throughout: core k corresponds to integer bit k.
 """
 
